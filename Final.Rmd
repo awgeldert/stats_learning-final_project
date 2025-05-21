@@ -1,0 +1,323 @@
+---
+title: "Final Project"
+author: "Anna Geldert"
+date: 5/19/25
+output: html_document
+---
+
+## Introduction and Goals
+
+For the final project, I decided to explore the usefulness of smoothing splines for processing climate data. As an Earth and Climate Sciences major, I have frequently found myself grappling with large data sets of temperature and precipitation records. Climate data is notoriously noisy because it varies on daily, seasonal, inter-annual, and multi-decadal time scales. Additionally, temperature and precipitation changes can behave wildly different in different parts of the world. This makes it difficult to identify long-term, global trends in temperature and precipitation over time, and even more difficult to make predictions about future climate change.
+
+When reading about some of the statistical learning methods we didn't cover in class, I was intrigued by smoothing splines as a way to reduce noise in data. I learned that smoothing splines are one of several ways of applying a best-fit curve to the data, so that general trends are preserved without overfitting the data. Smoothing splines work by applying a Loss/Penalty function. Losses are defined as the residual sum of squares between the predicted curve value and the actual value, which smoothing splines attempt to minimize. At the same time, penalties are applied for too much variation in the predicted curve, which the spline from overfitting to go through every point in the data set. Smoothing splines can be adjusted using a smoothing parameter, $\lambda$. A low value of $\lambda$ results in "rougher" curves, which more closely fits the data and results in low bias but high variance. A higher value of $\lambda$ results in "smoother" curves, increasing the bias but decreasing the variance.
+
+For this project, my goal was to apply a variety of different smoothing splines to climate data and determine what smoothing parameters are most useful for different climate-related research questions. 
+  
+
+Below I load in the tools I will need for this assignment: 
+
+```{r}
+library(tidyverse)
+library(here)
+library(rpart)
+library(rpart.plot)
+library(splines)
+library(ggformula)
+```
+
+
+
+## Climate Data 
+
+I found this climate data set from Kaggle, which shows average surface temperature for countries around the world for each year from 1961 to 2022. Surface temperatures are listed as an anomaly compared to the 1951-1980 average, in degrees Celcius.
+
+First I read in the data:
+
+```{r}
+climate <- read_csv(here("final project", "climate_change_indicators.csv"))
+```
+
+Then, I needed to pivot the data so the years are shown as rows, rather than columns. I also removed columns I didn't feel were necessary for my analysis: 
+
+```{r}
+climate_longer <- climate |> 
+  dplyr::select(-Indicator, -Unit, -Source, -CTS_Code, -CTS_Name, -CTS_Full_Descriptor, -ObjectId) |>
+  pivot_longer(c(-Country, -ISO2, -ISO3),
+               names_to = "Year", 
+               values_to = "Temperature_Anomaly")|>
+  mutate(Year = as.numeric(Year |> str_remove_all("F"))) 
+```
+
+
+I also created a new column, called "Warming Level", which classifies the temperature anomaly for each year/country combination as Very Cool, Cool, Warm, Very Warm, or Extremely Warm:
+
+```{r}
+climate_clean <- climate_longer |>
+  mutate(Warming_Level = case_when(Temperature_Anomaly < -1.0 ~ "Very Cool",
+                                  Temperature_Anomaly < 0 & Temperature_Anomaly > -1.0 ~ "Cool",
+                                  Temperature_Anomaly > 0 & Temperature_Anomaly < 1.0 ~ "Warm",
+                                  Temperature_Anomaly > 1.0 & Temperature_Anomaly < 2.0 ~ "Very Warm", 
+                                  Temperature_Anomaly > 2.0 ~ "Extremely Warm")) 
+```
+
+
+Lastly, I calculated two new statistics: global warming average for each year, and long-term warming for each country. I then added added these as new columns in the data set:
+
+```{r}
+global_mean_warming <- climate_clean |>
+  group_by(Year) |>
+  summarize(global_mean_warming = mean(Temperature_Anomaly, na.rm = TRUE))
+
+climate_clean <- climate_clean |> 
+  filter(!ISO3 == "STP") |>
+  group_by(Country) |>
+  mutate(global_mean_warming = global_mean_warming)
+
+longterm_warming <- climate_clean |>
+  group_by(Country) |>
+  summarize(longterm_warming = mean(Temperature_Anomaly, na.rm = TRUE))
+
+climate_clean <- climate_clean |>
+  group_by(Year) |>
+  mutate(longterm_warming = longterm_warming)
+```
+
+
+To get a sense of the results, I created a scatter plot of the temperature anomalies over time, color-coded by warming level. As shown, temperatures have dramatically increased over time, but the results vary by year and by country:
+
+```{r}
+climate_clean |> 
+  ggplot() +
+  geom_point(aes(x = Year, y = Temperature_Anomaly, color = Warming_Level)) +
+  scale_color_manual(values = c("deepskyblue2", "red4", "deepskyblue4", "firebrick3", "indianred1"))
+```
+
+
+I also looked at a few individual countries, including Iceland, Madagascar, and the United States. The three countries showed similar overall warming trends, but specific years looked quite different:
+
+```{r}
+# Iceland
+
+climate_clean |>
+  filter(Country == "Iceland")|>
+  ggplot() +
+  geom_line(aes(x = Year, y = Temperature_Anomaly)) +
+  geom_point(aes(x = Year, y = Temperature_Anomaly, color = Warming_Level)) +
+  scale_color_manual(values = c("deepskyblue2", "deepskyblue4", "firebrick3", "indianred1"))
+```
+
+```{r}
+# Madagascar
+
+climate_clean |>
+  filter(Country == "Madagascar, Rep. of")|>
+  ggplot() +
+  geom_line(aes(x = Year, y = Temperature_Anomaly)) +
+  geom_point(aes(x = Year, y = Temperature_Anomaly, color = Warming_Level)) +
+  scale_color_manual(values = c("deepskyblue2", "firebrick3", "indianred1"))
+```
+
+```{r}
+# United States
+
+climate_clean |>
+  filter(Country == "United States")|>
+  ggplot() +
+  geom_line(aes(x = Year, y = Temperature_Anomaly)) +
+  geom_point(aes(x = Year, y = Temperature_Anomaly, color = Warming_Level)) +
+  scale_color_manual(values = c("deepskyblue2", "red4", "firebrick3", "indianred1"))
+```
+
+## (Flaws of) Using LDA and Tree-Based Methods
+
+Some of the previous statistical learning methods we have used in class could, in theory, be used to assess climate change over time. 
+
+For example, LDA would be able to make predictions about whether the temperature anomaly is cooler than average of warmer than average based on the year and country. However, this would not be a very accurate model, because there are several decades where the temperature oscillates between cool and warm temperature anomalies on an inter-annual basis, which an LDA model would not be able to account for. Furthermore, it would not be able to distinguish between different degrees of warming (for example, between years classified as "Warm" and years classified as "Very Warm").
+
+Tree-based statistical learning methods can get at a bit more nuance in temperature predictions. For example, we can make a decision tree to predict the warming level based on the year: 
+
+```{r}
+tree1 <- rpart(Warming_Level ~ Year,
+               data = climate_clean)
+```
+
+```{r}
+rpart.plot(tree1)
+```
+
+This tree does a decently good job at capturing broad trends in warming over time, but it makes huge generalizations and misses a TON of the short-term variability. For example, it predicts "Cool" climates for all years before 1977, but there are many, many countries that begin experiencing "Warm" and even "Very Warm" climates long before that. It also breaks up the data into only four time slices, even though many countries oscillate between temperature regimes on an inter-annual basis. Overall, the tree does not accurately assess the noisy climate data very well, and lots of important information is lost.
+
+
+## Incorporating Smoothing Splines
+
+To incorporate smoothing splines into the data, we need a package called `splines`. This package allows for both regression splines and smoothing splines. The function `smooth.spline` takes one required argument, the x-variable, and one not-technically-required-but-needed-for-this-project argument, the y-variable. The function also allows you to adjust the parameters of the smoothing spline, either by adjusting $\lambda$ directly using `spar` or `lambda`, by specifying the equivalent degrees of freedom (which also controls the smoothness/roughness) by using `df`, or by automatically selecting the optimal smoothness using `cv = TRUE`.
+
+```{r, eval = FALSE}
+?smooth.spline
+```
+
+
+Additionally, the function `geom_spline` opperates within ggplot to add a smoothing spline curve to a graph of a data set. It has uses aesthetic arguments as other ggplot graphs and has the same optional arguments and parameter adjustments as `smooth.spline`.
+
+```{r, eval = FALSE}
+?geom_spline
+```
+
+
+#### Optimal Splines
+
+I started by applying a smoothing spline to my first scatterplot, showing temperature anomalies for all countries over time. I used `cv = TRUE` to start, to see what the optimal smoothing curve looks like:
+
+```{r}
+climate_clean |> 
+  ggplot() +
+  geom_point(aes(x = Year, y = Temperature_Anomaly, color = Warming_Level)) +
+  geom_spline(aes(x = Year, y = Temperature_Anomaly), linewidth = 2.5, cv = TRUE) +
+  scale_color_manual(values = c("deepskyblue2", "red4", "deepskyblue4", "firebrick3", "indianred1"))
+```
+
+
+I also created smoothing splines for the three countries I looked at earlier: 
+
+```{r}
+# Iceland
+
+climate_clean |>
+  filter(Country == "Iceland")|>
+  ggplot() +
+  geom_point(aes(x = Year, y = Temperature_Anomaly, color = Warming_Level)) +
+  geom_spline(aes(x = Year, y = Temperature_Anomaly), cv = TRUE) +
+  scale_color_manual(values = c("deepskyblue2", "deepskyblue4", "firebrick3", "indianred1"))
+```
+
+```{r}
+# Madagascar
+
+climate_clean |>
+  filter(Country == "Madagascar, Rep. of")|>
+  ggplot() +
+  geom_point(aes(x = Year, y = Temperature_Anomaly, color = Warming_Level)) +
+  geom_spline(aes(x = Year, y = Temperature_Anomaly), cv = TRUE) +
+  scale_color_manual(values = c("deepskyblue2", "firebrick3", "indianred1"))
+```
+
+```{r}
+# United States
+
+climate_clean |>
+  filter(Country == "United States")|>
+  ggplot() +
+  geom_point(aes(x = Year, y = Temperature_Anomaly, color = Warming_Level)) +
+  geom_spline(aes(x = Year, y = Temperature_Anomaly), cv = TRUE) +
+  scale_color_manual(values = c("deepskyblue2", "red4", "firebrick3", "indianred1"))
+```
+
+I found it really interesting how the optimal curves different between these three countries. This seems to be a function of how much inter-annual variability in temperature anomaly each country exhibits. Iceland exhibits high inter-annual variability, which leads to high losses because the difference between the spline value and the actual value is greater. To balance this, the spline is kept relatively simple, reducing the penalties associated with "rougher" splines. Madagascar is the opposite: it has low inter-annual variability, resulting in low losses and allowing for increased roughness in the curve. The United States lies somewhere in the middle.
+
+
+#### Adjusting the Smoothing Parameters
+
+Next I wanted to experiment with adjusting the different parameters for $\lambda$, using the United States as an example. I did this by adjusting the `spar` argument in `geom_line`, which essentially represents $\lambda$ as a scaled value between 0 and 1. 
+
+First, I looked at the smoothing spline when `spar = 0`. This creates a curve that perfectly fits the data by connecting every point, leading to low bias but high variance in predictions:
+
+```{r}
+climate_clean |>
+  filter(Country == "United States")|>
+  ggplot() +
+  geom_point(aes(x = Year, y = Temperature_Anomaly, color = Warming_Level)) +
+  geom_spline(aes(x = Year, y = Temperature_Anomaly), spar = 0) +
+  scale_color_manual(values = c("deepskyblue2", "red4", "firebrick3", "indianred1"))
+```
+
+Then, I looked at the smoothing spline when `spar = 1`. This creates a linear fit, resulting in very high bias but low variance (oppositve results as the graph above):
+
+```{r}
+climate_clean |>
+  filter(Country == "United States")|>
+  ggplot() +
+  geom_point(aes(x = Year, y = Temperature_Anomaly, color = Warming_Level)) +
+  geom_spline(aes(x = Year, y = Temperature_Anomaly), spar = 1) +
+  scale_color_manual(values = c("deepskyblue2", "red4", "firebrick3", "indianred1"))
+```
+
+Next I tried `spar = 0.5`, something right in the middle of the above graphs: 
+
+```{r}
+climate_clean |>
+  filter(Country == "United States")|>
+  ggplot() +
+  geom_point(aes(x = Year, y = Temperature_Anomaly, color = Warming_Level)) +
+  geom_spline(aes(x = Year, y = Temperature_Anomaly), spar = 0.5) +
+  scale_color_manual(values = c("deepskyblue2", "red4", "firebrick3", "indianred1"))
+```
+
+Lastly, I made graphs with `spar = 0.25` and `spar = 0.75`. The optimal curve from earlier appears to fall somewhere between `spar = 0.5` and `spar = 0.75` for the United States.
+
+```{r}
+climate_clean |>
+  filter(Country == "United States")|>
+  ggplot() +
+  geom_point(aes(x = Year, y = Temperature_Anomaly, color = Warming_Level)) +
+  geom_spline(aes(x = Year, y = Temperature_Anomaly), spar = 0.25) +
+  scale_color_manual(values = c("deepskyblue2", "red4", "firebrick3", "indianred1"))
+```
+```{r}
+climate_clean |>
+  filter(Country == "United States")|>
+  ggplot() +
+  geom_point(aes(x = Year, y = Temperature_Anomaly, color = Warming_Level)) +
+  geom_spline(aes(x = Year, y = Temperature_Anomaly), spar = 0.75) +
+  scale_color_manual(values = c("deepskyblue2", "red4", "firebrick3", "indianred1"))
+```
+
+Based on these results, as well as my own knowledge about climate trends and climate change predictions, it seems like different smoothing splines could serve different purposes in the field of climate data analysis. "Rougher" splines, like the graph generated for Madagascar and the graph generated for the United States using `spar = 0.25`, are more adjusted to smaller-scale trends. Therefore, they could be used to generate short-term or inter-annual temperature predictions for a certain country or region. On the other hand, "smoother" splines, like the one created for Iceland or the one created for the United States using `spar = 0.75`, model more general climate trends. They could be used to assess long-term variability in the climate system, such as multi-decadal warming due to contemporary climate change. 
+
+
+#### Generating Predictions 
+
+The last thing I wanted to attempt with this project was using smoothing splines to generate temperature anomaly predictions based on the spline curve. This can be done using the `smooth.spline` function. However, I could only figure out how to reasonably do it for one country at a time, because it only works if there is one temperature anomaly value for each year.
+
+I decided to generate predictions for a new country, Spain. Below is a `geom_spline` graph for Spain, using a 0.5 smoothness parameter:
+```{r}
+climate_clean |>
+  filter(Country == "Spain")|>
+  ggplot() +
+  geom_point(aes(x = Year, y = Temperature_Anomaly, color = Warming_Level)) +
+  geom_spline(aes(x = Year, y = Temperature_Anomaly), spar = 0.5) +
+  scale_color_manual(values = c("deepskyblue2", "red4", "firebrick3", "indianred1"))
+```
+
+
+I generated a smoothing spline using `smooth.spline`, and then generated predictions using the `predict` function, both for a smoothing parameter of 0.25:
+
+```{r}
+spain_climate <- climate_clean |>
+  filter(Country == "Spain")
+
+fit0.25 <- smooth.spline(spain_climate$Year, spain_climate$Temperature_Anomaly, spar = 0.25)
+
+predictions0.25 <- predict(fit0.25)
+
+predictions0.25
+```
+
+The predicted values for fit0.25 pretty closely resemble the actual values, though they do simplify the curve a bit. As I mentioned earlier, this would be optimal for predicting short-term variability in the climate system, because there is more flexibility for inter-annual variability. 
+
+I also generated predictions for a smoothness parameter of 0.75:
+
+```{r}
+fit0.75 <- smooth.spline(spain_climate$Year, spain_climate$Temperature_Anomaly, spar = 0.75)
+
+predictions0.75 <- predict(fit0.75)
+
+predictions0.75
+```
+
+These predictions provide a smoother curve but are less accurate for specific years. These predictions are ideal for assessing longer-term trends in the climate system. For example, we can see that the average temperature in Spain fell in the first decade, but has been rising over the last several decades. 
+
+## Conclusion 
+
+I found this investigation into the usefulness of smoothing splines to be a really interesting application of statistical learning methods for climate data analysis. Something that I didn't get to in this report, but would be curious to learn more about, is the possibility of using smoothing splines to generate future predictions. In the most simple form, linear spline curves can predict the general trajectory of future climate warming by extrapolating the line into the future. Organizations like the IPCC (Integovernmental Panel on Climate Change) have already generated predictions for future climate until 2100 that appear to follow linear or logorithmic functions.  However, I wonder if more complex spline curves could be used to predict future temperatures with more nuance, such as by accounting for inter-annual variability in temperatures on a shorter scale. This could allow for short-term predictions that may be more useful for climate adaptation policy. Investigating the predictive capability of spline curves for future climate would be a really interesting option for future direction with this project.
+
+
